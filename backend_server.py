@@ -25,7 +25,7 @@ import uvicorn
 # CONFIGURATION
 # ============================================================================
 
-PROJECT_DIR = r"C:\Users\ishaa\Documents\5th sem el\main el"
+PROJECT_DIR = r"D:\EL\RUL-prediction-for-aircraft-subsystems"
 MODEL_DIR = os.path.join(PROJECT_DIR, "model_artifacts")
 DATA_DIR = os.path.join(PROJECT_DIR, "data")
 

@@ -211,14 +211,17 @@ export function useWebSocket({
     }
   }, []);
 
+  // Auto-connect on mount
   useEffect(() => {
+    connect();
     return () => {
       clearReconnectTimeout();
       if (wsRef.current) {
         wsRef.current.close();
       }
     };
-  }, [clearReconnectTimeout]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return {
     isConnected,

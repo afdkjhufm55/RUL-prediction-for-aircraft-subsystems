@@ -229,6 +229,11 @@ export function StreamViewer({
               ref={canvasRef}
               className="w-full h-full object-contain"
             />
+          ) : isConnected && !frameUrl ? (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
+              <Loader2 className="w-10 h-10 text-primary animate-spin" />
+              <span className="text-sm text-muted-foreground">Waiting for first frame...</span>
+            </div>
           ) : (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
               {isConnecting ? (

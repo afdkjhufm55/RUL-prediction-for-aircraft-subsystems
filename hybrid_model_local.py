@@ -1,9 +1,13 @@
 """
 ================================================================================
-HYBRID DIGITAL TWIN - FULL LOCAL TRAINING SCRIPT
+HYBRID DIGITAL TWIN - OPTIMIZED TRAINING SCRIPT
 ================================================================================
-Optimized for local PC with 32GB RAM
-Trains both Baseline and Hybrid models with full data
+Optimized for 24GB RAM laptop (no GPU required)
+Key optimizations:
+  1. Subsampling factor 10 at load time  → 6.5M rows become 651K
+  2. Keras Sequence generator            → sequences never fully materialized
+  3. Dev/test kept separate              → proper benchmark split
+  4. float32 throughout                  → half the memory of float64
 
 Run: python hybrid_model_local.py
 ================================================================================
@@ -14,9 +18,8 @@ import pandas as pd
 import os
 import json
 import time
-from pathlib import Path
+import gc
 
-# Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 import tensorflow as tf
@@ -26,556 +29,493 @@ from tensorflow.keras.layers import (
     Dense, Dropout, BatchNormalization, Concatenate, GlobalAveragePooling1D
 )
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
-from sklearn.model_selection import train_test_split
+from tensorflow.keras.utils import Sequence
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import joblib
+import h5py
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-# Paths - Update if needed
-PROJECT_DIR = r"C:\Users\ishaa\Documents\5th sem el\main el"
-DATA_DIR = os.path.join(PROJECT_DIR, "data")
-MODEL_DIR = os.path.join(PROJECT_DIR, "model_artifacts")
-
-# Create directories
+PROJECT_DIR   = r"D:\EL\RUL-prediction-for-aircraft-subsystems"
+DATA_DIR      = os.path.join(PROJECT_DIR, "nmapss")
+MODEL_DIR     = os.path.join(PROJECT_DIR, "model_artifacts")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Model Parameters
-SEQ_LEN = 50
-RUL_CLIP = 125
-EPOCHS = 50
-BATCH_SIZE = 256
+# ── memory knobs ──────────────────────────────────────────────────────────────
+SUBSAMPLE     = 10      # keep every Nth row  (10 → ~651K rows, ~2 GB df)
+SEQ_LEN       = 30      # window length        (30 instead of 50 → 64% less memory)
+STRIDE        = 5       # step between windows (5 → 5× fewer sequences)
+# ─────────────────────────────────────────────────────────────────────────────
+
+RUL_CLIP      = 125
+EPOCHS        = 50
+BATCH_SIZE    = 512     # larger batch → fewer Python iterations on CPU
 VALIDATION_SPLIT = 0.2
 
 # ============================================================================
-# ANSYS PHYSICS DATA (From your simulations)
+# ANSYS PHYSICS CONSTANTS
 # ============================================================================
 
 ANSYS_PHYSICS = {
-    # Combustion Chamber Thermal (°C)
-    'chamber_temp_min': 626.73,
-    'chamber_temp_max': 627.0,
-    'chamber_temp_mean': 626.86,
-    
-    # Nozzle Thermal (°C)
-    'nozzle_temp_min': 474.45,
-    'nozzle_temp_max': 475.0,
-    'nozzle_temp_mean': 474.7,
-    
-    # Von Mises Stress (MPa)
-    'stress_min_mpa': 54.195,
-    'stress_max_mpa': 3543.9,
-    'stress_mean_mpa': 861.31,
-    
-    # Total Deformation (mm)
-    'deformation_min_mm': 0.0,
-    'deformation_max_mm': 0.18929,
+    'chamber_temp_min':    626.73,
+    'chamber_temp_max':    627.0,
+    'chamber_temp_mean':   626.86,
+    'nozzle_temp_min':     474.45,
+    'nozzle_temp_max':     475.0,
+    'nozzle_temp_mean':    474.7,
+    'stress_min_mpa':      54.195,
+    'stress_max_mpa':      3543.9,
+    'stress_mean_mpa':     861.31,
+    'deformation_min_mm':  0.0,
+    'deformation_max_mm':  0.18929,
     'deformation_mean_mm': 0.09596,
 }
 
 # ============================================================================
-# HELPER FUNCTIONS
+# HELPERS
 # ============================================================================
 
 def print_header(text):
-    """Print formatted header."""
     print("\n" + "="*70)
     print(f"  {text}")
     print("="*70)
 
-def print_progress(current, total, prefix='Progress'):
-    """Print progress bar."""
-    bar_length = 40
-    progress = current / total
-    block = int(bar_length * progress)
-    bar = "█" * block + "░" * (bar_length - block)
-    print(f"\r  {prefix}: [{bar}] {current}/{total} ({progress*100:.1f}%)", end='', flush=True)
-    if current == total:
-        print()
+def mem_usage(df):
+    mb = df.memory_usage(deep=True).sum() / 1024**2
+    return f"{mb:.1f} MB"
 
 # ============================================================================
-# DATA LOADING
+# DATA LOADING  (subsampled)
 # ============================================================================
 
-def load_cmapss_data():
-    """Load all C-MAPSS datasets."""
-    print_header("LOADING C-MAPSS DATA")
-    
-    cols = ['unit_nr', 'time_cycles'] + \
-           [f'op_{i}' for i in range(1, 4)] + \
-           [f's_{i}' for i in range(1, 22)]
-    
-    all_train = []
-    unit_offset = 0
-    
-    datasets = ['FD001', 'FD002', 'FD003', 'FD004']
-    
-    for fd in datasets:
-        train_path = os.path.join(DATA_DIR, f'train_{fd}.txt')
-        
-        if os.path.exists(train_path):
-            df = pd.read_csv(train_path, sep=r'\s+', header=None, names=cols)
-            
-            # Calculate RUL
-            max_cycles = df.groupby('unit_nr')['time_cycles'].max()
-            df = df.merge(max_cycles.rename('max_cycle'), left_on='unit_nr', right_index=True)
-            df['RUL'] = df['max_cycle'] - df['time_cycles']
-            df['RUL'] = df['RUL'].clip(upper=RUL_CLIP)
-            df['dataset'] = fd
-            
-            # Make unit_nr unique across datasets
-            df['unit_nr'] = df['unit_nr'] + unit_offset
-            unit_offset = df['unit_nr'].max() + 1
-            
-            all_train.append(df)
-            print(f"  ✓ {fd}: {len(df):,} rows, {df['unit_nr'].nunique()} engines")
-        else:
-            print(f"  ✗ {fd}: Not found at {train_path}")
-    
-    if not all_train:
-        raise ValueError(f"No data found in {DATA_DIR}")
-    
-    combined = pd.concat(all_train, ignore_index=True)
-    print(f"\n  ✓ TOTAL: {len(combined):,} rows, {combined['unit_nr'].nunique()} engines")
-    
-    return combined
+def load_data():
+    print_header("LOADING N-CMAPSS DS02  (subsample=1/{})".format(SUBSAMPLE))
+
+    h5_path = os.path.join(DATA_DIR, 'N-CMAPSS_DS02-006.h5')
+    if not os.path.exists(h5_path):
+        raise FileNotFoundError(f"File not found: {h5_path}")
+
+    print(f"  Source : {h5_path}")
+
+    with h5py.File(h5_path, 'r') as hdf:
+        def decode_var(key):
+            raw = hdf[key][()]
+            return [v.decode('utf-8') if isinstance(v, bytes) else str(v) for v in raw]
+
+        W_var   = decode_var('W_var')
+        X_s_var = decode_var('X_s_var')
+        X_v_var = decode_var('X_v_var')
+        A_var   = decode_var('A_var')
+        def load_split(tag):
+            """Load one split (dev/test) with subsampling applied."""
+            sl = slice(None, None, SUBSAMPLE)
+            W   = hdf[f'W_{tag}'][sl].astype(np.float32)
+            X_s = hdf[f'X_s_{tag}'][sl].astype(np.float32)
+            X_v = hdf[f'X_v_{tag}'][sl].astype(np.float32)
+            Y   = hdf[f'Y_{tag}'][sl].astype(np.float32)
+            A   = hdf[f'A_{tag}'][sl].astype(np.float32)
+            return W, X_s, X_v, Y, A
+
+        W_dev,   X_s_dev,   X_v_dev,   Y_dev,   A_dev   = load_split('dev')
+        W_test,  X_s_test,  X_v_test,  Y_test,  A_test  = load_split('test')
+
+    def build_df(W, X_s, X_v, Y, A, split_label):
+        df = pd.DataFrame(A, columns=A_var, dtype=np.float32)
+        df.rename(columns={'unit': 'unit_nr', 'cycle': 'time_cycles'}, inplace=True)
+
+        # operative conditions
+        for k, name in enumerate(['op_1', 'op_2', 'op_3']):
+            df[name] = W[:, k]
+
+        # physical sensors (X_s only — drop X_v to save memory)
+        for k in range(X_s.shape[1]):
+            df[f's_{k+1}'] = X_s[:, k]
+
+        df['RUL']   = np.clip(Y[:, 0], 0, RUL_CLIP)
+        df['split'] = split_label
+        return df
+
+    df_dev  = build_df(W_dev,  X_s_dev,  X_v_dev,  Y_dev,  A_dev,  'dev')
+    df_test = build_df(W_test, X_s_test, X_v_test, Y_test, A_test, 'test')
+
+    print(f"  Dev  rows : {len(df_dev):,}  engines: {df_dev['unit_nr'].nunique()}"
+          f"  RAM: {mem_usage(df_dev)}")
+    print(f"  Test rows : {len(df_test):,}  engines: {df_test['unit_nr'].nunique()}"
+          f"  RAM: {mem_usage(df_test)}")
+
+    # free raw arrays immediately
+    del W_dev, X_s_dev, X_v_dev, Y_dev, A_dev
+    del W_test, X_s_test, X_v_test, Y_test, A_test
+    gc.collect()
+
+    return df_dev, df_test
 
 # ============================================================================
 # PHYSICS FEATURE ENGINEERING
 # ============================================================================
 
-def create_physics_features(df):
-    """Create physics-based features from ANSYS simulation data."""
-    print_header("CREATING PHYSICS FEATURES")
-    
-    df = df.copy()
-    
-    # --- THERMAL FEATURES ---
-    print("  Creating thermal features...")
-    
-    # s_3: HPC outlet temp (Rankine) → Celsius
-    if 's_3' in df.columns:
-        s3_celsius = (df['s_3'] - 459.67) * 5/9
-        df['thermal_ratio'] = s3_celsius / ANSYS_PHYSICS['chamber_temp_max']
-        df['thermal_margin'] = (ANSYS_PHYSICS['chamber_temp_max'] - s3_celsius) / ANSYS_PHYSICS['chamber_temp_max']
-        df['thermal_margin'] = df['thermal_margin'].clip(lower=0)
-        print(f"    ✓ thermal_ratio: [{df['thermal_ratio'].min():.3f}, {df['thermal_ratio'].max():.3f}]")
-    
-    # s_4: LPT outlet temp → Nozzle thermal
-    if 's_4' in df.columns:
-        s4_celsius = (df['s_4'] - 459.67) * 5/9
-        df['nozzle_thermal_ratio'] = s4_celsius / ANSYS_PHYSICS['nozzle_temp_max']
-        print(f"    ✓ nozzle_thermal_ratio: [{df['nozzle_thermal_ratio'].min():.3f}, {df['nozzle_thermal_ratio'].max():.3f}]")
-    
-    # --- STRESS FEATURES ---
-    print("  Creating stress features...")
-    
-    if 's_7' in df.columns:
+def add_physics_features(df):
+    print_header("PHYSICS FEATURE ENGINEERING")
+
+    # ── Thermal ───────────────────────────────────────────────────────────────
+    if 's_3' in df.columns:                                   # T30 – HPC outlet (Rankine)
+        s3_c = (df['s_3'] - 459.67) * 5/9
+        df['thermal_ratio']  = (s3_c / ANSYS_PHYSICS['chamber_temp_max']).astype(np.float32)
+        df['thermal_margin'] = ((ANSYS_PHYSICS['chamber_temp_max'] - s3_c)
+                                / ANSYS_PHYSICS['chamber_temp_max']).clip(lower=0).astype(np.float32)
+
+    if 's_4' in df.columns:                                   # T48 – LPT outlet (Rankine)
+        s4_c = (df['s_4'] - 459.67) * 5/9
+        df['nozzle_thermal_ratio'] = (s4_c / ANSYS_PHYSICS['nozzle_temp_max']).astype(np.float32)
+
+    # ── Stress ────────────────────────────────────────────────────────────────
+    if 's_7' in df.columns:                                   # P30 – HPC outlet pressure
         p_min, p_max = df['s_7'].min(), df['s_7'].max()
-        pressure_norm = (df['s_7'] - p_min) / (p_max - p_min + 1e-6)
-        
+        p_norm = (df['s_7'] - p_min) / (p_max - p_min + 1e-6)
         stress_range = ANSYS_PHYSICS['stress_max_mpa'] - ANSYS_PHYSICS['stress_min_mpa']
-        df['stress_estimate_mpa'] = ANSYS_PHYSICS['stress_min_mpa'] + pressure_norm * stress_range
-        df['stress_intensity'] = df['stress_estimate_mpa'] / ANSYS_PHYSICS['stress_max_mpa']
-        print(f"    ✓ stress_estimate_mpa: [{df['stress_estimate_mpa'].min():.1f}, {df['stress_estimate_mpa'].max():.1f}]")
-    
-    # --- DEFORMATION FEATURES ---
-    print("  Creating deformation features...")
-    
+        df['stress_intensity'] = (ANSYS_PHYSICS['stress_min_mpa'] + p_norm * stress_range) \
+                                  / ANSYS_PHYSICS['stress_max_mpa']
+        df['stress_intensity'] = df['stress_intensity'].astype(np.float32)
+
+    # ── Deformation ───────────────────────────────────────────────────────────
     if 's_7' in df.columns and 's_3' in df.columns:
         p_norm = (df['s_7'] - df['s_7'].min()) / (df['s_7'].max() - df['s_7'].min() + 1e-6)
         t_norm = (df['s_3'] - df['s_3'].min()) / (df['s_3'].max() - df['s_3'].min() + 1e-6)
-        df['deformation_estimate_mm'] = (0.6 * p_norm + 0.4 * t_norm) * ANSYS_PHYSICS['deformation_max_mm']
-        print(f"    ✓ deformation_estimate_mm: [{df['deformation_estimate_mm'].min():.5f}, {df['deformation_estimate_mm'].max():.5f}]")
-    
-    # --- VIBRATION FEATURES ---
-    print("  Creating vibration features...")
-    
-    if 's_11' in df.columns and 's_15' in df.columns:
-        speed_norm = (df['s_11'] - df['s_11'].min()) / (df['s_11'].max() - df['s_11'].min() + 1e-6)
-        bypass_norm = (df['s_15'] - df['s_15'].min()) / (df['s_15'].max() - df['s_15'].min() + 1e-6)
-        df['vibration_index'] = speed_norm * (1 - 0.3 * bypass_norm)
-        print(f"    ✓ vibration_index: [{df['vibration_index'].min():.3f}, {df['vibration_index'].max():.3f}]")
-    
-    # --- FATIGUE ACCUMULATION ---
-    print("  Creating fatigue features...")
-    
+        df['deformation_index'] = ((0.6*p_norm + 0.4*t_norm)
+                                   * ANSYS_PHYSICS['deformation_max_mm']
+                                   / ANSYS_PHYSICS['deformation_max_mm']).astype(np.float32)
+
+    # ── Fatigue (cumulative stress per engine) ────────────────────────────────
     if 'stress_intensity' in df.columns:
-        df['fatigue_damage'] = df.groupby('unit_nr')['stress_intensity'].cumsum()
-        df['fatigue_damage'] = df.groupby('unit_nr')['fatigue_damage'].transform(
-            lambda x: x / x.max() if x.max() > 0 else 0
-        )
-        print(f"    ✓ fatigue_damage: [{df['fatigue_damage'].min():.3f}, {df['fatigue_damage'].max():.3f}]")
-    
-    # --- COMBINED PHYSICS INDEX ---
-    physics_cols = ['thermal_ratio', 'stress_intensity', 'vibration_index', 'fatigue_damage']
-    available = [c for c in physics_cols if c in df.columns]
-    
-    if available:
-        df['physics_degradation'] = df[available].mean(axis=1)
-        print(f"    ✓ physics_degradation: [{df['physics_degradation'].min():.3f}, {df['physics_degradation'].max():.3f}]")
-    
+        cumsum = df.groupby('unit_nr')['stress_intensity'].cumsum()
+        group_max = df.groupby('unit_nr')['stress_intensity'].transform('sum')
+        df['fatigue_damage'] = (cumsum / (group_max + 1e-6)).astype(np.float32)
+
+    physics_added = [c for c in
+                     ['thermal_ratio','thermal_margin','nozzle_thermal_ratio',
+                      'stress_intensity','deformation_index','fatigue_damage']
+                     if c in df.columns]
+    print(f"  Added {len(physics_added)} physics features: {physics_added}")
     return df
+
+# ============================================================================
+# ROLLING FEATURES  (only on key sensors to save RAM)
+# ============================================================================
 
 def add_rolling_features(df):
-    """Add rolling window features."""
-    print("\n  Creating rolling features...")
-    
-    key_sensors = ['s_2', 's_3', 's_4', 's_7', 's_11', 's_12', 's_15', 's_20', 's_21']
-    
-    for i, s in enumerate(key_sensors):
-        if s in df.columns:
-            df[f'{s}_ma5'] = df.groupby('unit_nr')[s].transform(
-                lambda x: x.rolling(window=5, min_periods=1).mean()
-            )
-            df[f'{s}_std5'] = df.groupby('unit_nr')[s].transform(
-                lambda x: x.rolling(window=5, min_periods=1).std().fillna(0)
-            )
-        print_progress(i+1, len(key_sensors), "Rolling features")
-    
+    print_header("ROLLING FEATURES  (window=5)")
+    key = ['s_2','s_3','s_4','s_7','s_11','s_12']   # reduced set
+    for s in key:
+        if s not in df.columns:
+            continue
+        grp = df.groupby('unit_nr')[s]
+        df[f'{s}_ma5']  = grp.transform(lambda x: x.rolling(5, min_periods=1).mean()).astype(np.float32)
+        df[f'{s}_std5'] = grp.transform(lambda x: x.rolling(5, min_periods=1).std().fillna(0)).astype(np.float32)
+        print(f"    ✓ {s}_ma5 / {s}_std5")
     return df
 
 # ============================================================================
-# SEQUENCE PREPARATION
+# KERAS SEQUENCE GENERATOR  (never materializes the full array)
 # ============================================================================
 
-def prepare_sequences(df, feature_cols, seq_len=SEQ_LEN):
-    """Prepare sequences for LSTM training."""
-    print(f"\n  Preparing sequences (seq_len={seq_len})...")
-    
-    X_list, y_list = [], []
-    engines = df['unit_nr'].unique()
-    
-    for i, engine in enumerate(engines):
-        engine_df = df[df['unit_nr'] == engine].sort_values('time_cycles')
-        
-        if len(engine_df) < seq_len:
-            continue
-        
-        features = engine_df[feature_cols].values
-        rul = engine_df['RUL'].values
-        
-        for j in range(len(engine_df) - seq_len + 1):
-            X_list.append(features[j:j+seq_len])
-            y_list.append(rul[j+seq_len-1])
-        
-        if (i + 1) % 50 == 0 or i == len(engines) - 1:
-            print_progress(i+1, len(engines), "Engines processed")
-    
-    X = np.array(X_list, dtype=np.float32)
-    y = np.array(y_list, dtype=np.float32)
-    
-    print(f"  ✓ Created {len(X):,} sequences, shape: {X.shape}")
-    
-    return X, y
+class RULSequence(Sequence):
+    """
+    Yields (X_batch, y_batch) without storing all sequences in RAM.
+    Indices are pre-built (lightweight list of (engine_idx, start_row)),
+    then data is sliced on-the-fly from the scaled numpy arrays stored
+    per-engine.
+    """
+
+    def __init__(self, engine_arrays, seq_len, stride, batch_size, shuffle=True):
+        """
+        engine_arrays : list of (features_array, rul_array) per engine
+        """
+        self.ea         = engine_arrays
+        self.seq_len    = seq_len
+        self.stride     = stride
+        self.batch_size = batch_size
+        self.shuffle    = shuffle
+
+        # build index: list of (engine_id, start_idx)
+        self.index = []
+        for eid, (feat, rul) in enumerate(engine_arrays):
+            n = len(feat)
+            for start in range(0, n - seq_len + 1, stride):
+                self.index.append((eid, start))
+
+        self.index = np.array(self.index, dtype=np.int32)
+        if shuffle:
+            np.random.shuffle(self.index)
+
+        print(f"    Generator: {len(self.index):,} windows  "
+              f"batch_size={batch_size}  "
+              f"steps={len(self):,}")
+
+    def __len__(self):
+        return int(np.ceil(len(self.index) / self.batch_size))
+
+    def __getitem__(self, batch_idx):
+        batch_ids = self.index[batch_idx*self.batch_size :
+                               (batch_idx+1)*self.batch_size]
+        X_list, y_list = [], []
+        for eid, start in batch_ids:
+            feat, rul = self.ea[eid]
+            X_list.append(feat[start : start + self.seq_len])
+            y_list.append(rul[start + self.seq_len - 1])
+
+        X = np.stack(X_list).astype(np.float32)
+        y = np.array(y_list, dtype=np.float32)
+
+        # targets: normalised RUL + dRUL (approx as 0 for generator simplicity)
+        y_norm = y / RUL_CLIP
+        y_drul = np.zeros_like(y_norm)
+        return X, np.column_stack([y_norm, y_drul])
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.index)
+
+
+def build_engine_arrays(df, feature_cols, scaler=None, fit_scaler=False):
+    """
+    Returns (engine_arrays, scaler).
+    engine_arrays = list of (scaled_features, rul) per engine, sorted by cycle.
+    """
+    engines = sorted(df['unit_nr'].unique())
+    all_feat = df[feature_cols].values.astype(np.float32)
+
+    if fit_scaler:
+        scaler = StandardScaler()
+        scaler.fit(all_feat)
+
+    ea = []
+    for eng in engines:
+        mask = df['unit_nr'] == eng
+        edf  = df[mask].sort_values('time_cycles')
+        feat = scaler.transform(edf[feature_cols].values.astype(np.float32))
+        rul  = edf['RUL'].values.astype(np.float32)
+        ea.append((feat, rul))
+
+    return ea, scaler
 
 # ============================================================================
-# MODEL ARCHITECTURE
+# MODEL
 # ============================================================================
 
-def build_cnn_bilstm_model(input_shape):
-    """Build CNN-BiLSTM hybrid architecture."""
-    inputs = Input(shape=input_shape, name='input')
-    
-    # === CNN Branch ===
-    cnn = Conv1D(64, 3, activation='relu', padding='same')(inputs)
-    cnn = BatchNormalization()(cnn)
-    cnn = Conv1D(64, 3, activation='relu', padding='same')(cnn)
-    cnn = MaxPooling1D(2)(cnn)
-    cnn = Dropout(0.2)(cnn)
-    
-    cnn = Conv1D(128, 3, activation='relu', padding='same')(cnn)
-    cnn = BatchNormalization()(cnn)
-    cnn = Conv1D(128, 3, activation='relu', padding='same')(cnn)
-    cnn = MaxPooling1D(2)(cnn)
-    cnn = Dropout(0.2)(cnn)
-    
-    # === BiLSTM Branch ===
-    lstm = Bidirectional(LSTM(64, return_sequences=True))(inputs)
-    lstm = Dropout(0.2)(lstm)
-    lstm = Bidirectional(LSTM(32, return_sequences=False))(lstm)
-    lstm = Dropout(0.2)(lstm)
-    
-    # === Combine ===
-    cnn_flat = GlobalAveragePooling1D()(cnn)
-    combined = Concatenate()([cnn_flat, lstm])
-    
-    # === Dense Layers ===
-    x = Dense(128, activation='relu')(combined)
+def build_model(n_features):
+    inputs = Input(shape=(SEQ_LEN, n_features), name='input')
+
+    # CNN branch
+    x = Conv1D(64, 3, activation='relu', padding='same')(inputs)
     x = BatchNormalization()(x)
-    x = Dropout(0.3)(x)
-    
-    x = Dense(64, activation='relu')(x)
+    x = Conv1D(64, 3, activation='relu', padding='same')(x)
+    x = MaxPooling1D(2)(x)
     x = Dropout(0.2)(x)
-    
-    # === Output: RUL + dRUL ===
-    rul_output = Dense(1, activation='linear', name='rul')(x)
-    drul_output = Dense(1, activation='tanh', name='drul')(x)
-    outputs = Concatenate(name='output')([rul_output, drul_output])
-    
-    model = Model(inputs=inputs, outputs=outputs)
-    
+    x = Conv1D(128, 3, activation='relu', padding='same')(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling1D(2)(x)
+    x = Dropout(0.2)(x)
+    cnn_out = GlobalAveragePooling1D()(x)
+
+    # BiLSTM branch
+    y = Bidirectional(LSTM(64, return_sequences=True))(inputs)
+    y = Dropout(0.2)(y)
+    lstm_out = Bidirectional(LSTM(32))(y)
+    lstm_out = Dropout(0.2)(lstm_out)
+
+    combined = Concatenate()([cnn_out, lstm_out])
+    z = Dense(128, activation='relu')(combined)
+    z = BatchNormalization()(z)
+    z = Dropout(0.3)(z)
+    z = Dense(64, activation='relu')(z)
+    z = Dropout(0.2)(z)
+
+    rul_out  = Dense(1, activation='linear', name='rul')(z)
+    drul_out = Dense(1, activation='tanh',   name='drul')(z)
+    out      = Concatenate(name='output')([rul_out, drul_out])
+
+    model = Model(inputs, out)
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
+                  loss='mse', metrics=['mae'])
     return model
 
 # ============================================================================
-# TRAINING FUNCTION
+# TRAIN ONE MODEL
 # ============================================================================
 
-def train_model(X, y, feature_cols, model_name, save_dir):
-    """Train model and save artifacts."""
-    print_header(f"TRAINING {model_name.upper()} MODEL")
-    
-    start_time = time.time()
-    
-    # Split data
-    print(f"\n  Splitting data (80/20)...")
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=VALIDATION_SPLIT, random_state=42
-    )
-    print(f"    Train: {len(X_train):,} samples")
-    print(f"    Val:   {len(X_val):,} samples")
-    
-    # Scale features
-    print(f"  Scaling features...")
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(
-        X_train.reshape(-1, X_train.shape[-1])
-    ).reshape(X_train.shape)
-    X_val_scaled = scaler.transform(
-        X_val.reshape(-1, X_val.shape[-1])
-    ).reshape(X_val.shape)
-    
-    # Prepare targets (RUL normalized + dRUL)
-    y_train_norm = y_train / RUL_CLIP
-    y_val_norm = y_val / RUL_CLIP
-    y_train_drul = np.gradient(y_train_norm)
-    y_val_drul = np.gradient(y_val_norm)
-    
-    y_train_combined = np.column_stack([y_train_norm, y_train_drul])
-    y_val_combined = np.column_stack([y_val_norm, y_val_drul])
-    
-    # Build model
-    print(f"\n  Building CNN-BiLSTM model...")
-    model = build_cnn_bilstm_model((X_train.shape[1], X_train.shape[2]))
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-        loss='mse',
-        metrics=['mae']
-    )
-    print(f"    Parameters: {model.count_params():,}")
-    print(f"    Input shape: {X_train.shape[1:]}")
-    print(f"    Features: {X_train.shape[2]}")
-    
-    # Callbacks
+def train_model(df_train, df_val_engines, feature_cols, model_name):
+    print_header(f"TRAINING  {model_name.upper()}")
+    t0 = time.time()
+
+    n_feat = len(feature_cols)
+    print(f"  Features : {n_feat}")
+
+    # build per-engine arrays for train split
+    print("  Fitting scaler on training data...")
+    train_ea, scaler = build_engine_arrays(df_train, feature_cols, fit_scaler=True)
+
+    # split train engines into train / val  (last 20% of engines → val)
+    n_val   = max(1, int(len(train_ea) * VALIDATION_SPLIT))
+    val_ea  = train_ea[-n_val:]
+    tr_ea   = train_ea[:-n_val]
+
+    train_gen = RULSequence(tr_ea,  SEQ_LEN, STRIDE, BATCH_SIZE, shuffle=True)
+    val_gen   = RULSequence(val_ea, SEQ_LEN, STRIDE, BATCH_SIZE, shuffle=False)
+
+    model = build_model(n_feat)
+    print(f"  Parameters: {model.count_params():,}")
+
     callbacks = [
-        EarlyStopping(
-            monitor='val_loss',
-            patience=10,
-            restore_best_weights=True,
-            verbose=1
-        ),
-        ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.5,
-            patience=5,
-            min_lr=1e-6,
-            verbose=1
-        ),
-        ModelCheckpoint(
-            os.path.join(save_dir, f'{model_name}_best.keras'),
-            monitor='val_loss',
-            save_best_only=True,
-            verbose=0
-        )
+        EarlyStopping(monitor='val_loss', patience=8,
+                      restore_best_weights=True, verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5,
+                          patience=4, min_lr=1e-6, verbose=1),
+        ModelCheckpoint(os.path.join(MODEL_DIR, f'{model_name}_best.keras'),
+                        monitor='val_loss', save_best_only=True, verbose=0),
     ]
-    
-    # Train
-    print(f"\n  Training for up to {EPOCHS} epochs...")
-    print(f"  " + "-"*50)
-    
+
     history = model.fit(
-        X_train_scaled, y_train_combined,
-        validation_data=(X_val_scaled, y_val_combined),
+        train_gen,
+        validation_data=val_gen,
         epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
         callbacks=callbacks,
-        verbose=1
+        verbose=1,
     )
-    
-    # Evaluate
-    print(f"\n  Evaluating...")
-    y_pred = model.predict(X_val_scaled, verbose=0)
-    y_pred_rul = y_pred[:, 0] * RUL_CLIP
-    
-    rmse = np.sqrt(mean_squared_error(y_val, y_pred_rul))
-    mae = mean_absolute_error(y_val, y_pred_rul)
-    
-    elapsed = time.time() - start_time
-    
-    print(f"\n  " + "="*50)
-    print(f"  📊 {model_name.upper()} RESULTS:")
-    print(f"     RMSE: {rmse:.2f} cycles")
-    print(f"     MAE:  {mae:.2f} cycles")
-    print(f"     Time: {elapsed/60:.1f} minutes")
-    print(f"  " + "="*50)
-    
-    # Save artifacts
-    print(f"\n  Saving model artifacts...")
-    
-    model.save(os.path.join(save_dir, f'{model_name}_model.keras'))
-    joblib.dump(scaler, os.path.join(save_dir, f'{model_name}_scaler.save'))
-    
-    with open(os.path.join(save_dir, f'{model_name}_features.json'), 'w') as f:
+
+    # ── evaluate on held-out test engines ────────────────────────────────────
+    print("\n  Evaluating on test engines...")
+    test_ea, _ = build_engine_arrays(df_val_engines, feature_cols, scaler=scaler)
+
+    y_true_all, y_pred_all = [], []
+    for feat, rul in test_ea:
+        # slide window with stride 1 for evaluation
+        n = len(feat)
+        if n < SEQ_LEN:
+            continue
+        X_e = np.stack([feat[i:i+SEQ_LEN] for i in range(0, n-SEQ_LEN+1, 1)])
+        preds = model.predict(X_e, batch_size=BATCH_SIZE, verbose=0)
+        y_pred_all.append(preds[:, 0] * RUL_CLIP)
+        y_true_all.append(rul[SEQ_LEN-1:])
+
+    y_true = np.concatenate(y_true_all)
+    y_pred = np.concatenate(y_pred_all)
+
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    mae  = float(mean_absolute_error(y_true, y_pred))
+    elapsed = time.time() - t0
+
+    print(f"\n  ┌─────────────────────────────┐")
+    print(f"  │  {model_name.upper():<10}  RMSE: {rmse:6.2f}  MAE: {mae:6.2f}  │")
+    print(f"  │  Time: {elapsed/60:.1f} min               │")
+    print(f"  └─────────────────────────────┘")
+
+    # save
+    model.save(os.path.join(MODEL_DIR, f'{model_name}_model.keras'))
+    joblib.dump(scaler, os.path.join(MODEL_DIR, f'{model_name}_scaler.save'))
+    with open(os.path.join(MODEL_DIR, f'{model_name}_features.json'), 'w') as f:
         json.dump(feature_cols, f, indent=2)
-    
-    metrics = {
-        'rmse': float(rmse),
-        'mae': float(mae),
-        'epochs_trained': len(history.history['loss']),
-        'training_time_minutes': elapsed / 60
-    }
-    
-    with open(os.path.join(save_dir, f'{model_name}_metrics.json'), 'w') as f:
-        json.dump(metrics, f, indent=2)
-    
-    print(f"  ✓ Saved to {save_dir}")
-    
-    return model, scaler, metrics
+    with open(os.path.join(MODEL_DIR, f'{model_name}_metrics.json'), 'w') as f:
+        json.dump({'rmse': rmse, 'mae': mae,
+                   'epochs': len(history.history['loss']),
+                   'time_min': elapsed/60}, f, indent=2)
+
+    return model, scaler, {'rmse': rmse, 'mae': mae, 'time_min': elapsed/60}
 
 # ============================================================================
-# MAIN EXECUTION
+# MAIN
 # ============================================================================
 
 def main():
-    """Main training pipeline."""
-    print("\n")
-    print("╔" + "═"*68 + "╗")
-    print("║" + " "*68 + "║")
-    print("║    🚀 HYBRID DIGITAL TWIN - FULL MODEL TRAINING                    ║")
-    print("║    Physics-Enhanced RUL Prediction with ANSYS Integration          ║")
-    print("║" + " "*68 + "║")
+    print("\n╔" + "═"*68 + "╗")
+    print("║  🚀 HYBRID DIGITAL TWIN — OPTIMISED FOR 24 GB RAM" + " "*18 + "║")
+    print("║  Physics-Informed CNN-BiLSTM on N-CMAPSS DS02" + " "*22 + "║")
     print("╚" + "═"*68 + "╝")
-    
-    total_start = time.time()
-    
-    # Check GPU
+
+    t_total = time.time()
+
+    # GPU check
     print_header("SYSTEM CHECK")
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
-        print(f"  ✓ GPU detected: {gpus[0].name}")
-        print(f"    Training will be accelerated!")
+        print(f"  ✓ GPU : {gpus[0].name}")
     else:
-        print(f"  ℹ No GPU detected, using CPU")
-        print(f"    Training will take ~45-60 minutes")
-    
-    print(f"\n  Project: {PROJECT_DIR}")
-    print(f"  Data: {DATA_DIR}")
-    print(f"  Output: {MODEL_DIR}")
-    
-    # Load data
-    df = load_cmapss_data()
-    
-    # Create physics features
-    df = create_physics_features(df)
-    df = add_rolling_features(df)
-    df = df.fillna(0)
-    
-    # Define feature sets
-    print_header("DEFINING FEATURE SETS")
-    
-    # Baseline: Sensors + Operating conditions + Rolling
-    sensor_cols = [f's_{i}' for i in range(1, 22)]
-    op_cols = [f'op_{i}' for i in range(1, 4)]
-    rolling_cols = [c for c in df.columns if '_ma5' in c or '_std5' in c]
-    
-    baseline_features = [c for c in sensor_cols + op_cols + rolling_cols if c in df.columns]
-    
-    # Hybrid: Baseline + Physics
-    physics_cols = [
-        'thermal_ratio', 'thermal_margin', 'nozzle_thermal_ratio',
-        'stress_estimate_mpa', 'stress_intensity',
-        'deformation_estimate_mm', 'vibration_index',
-        'fatigue_damage', 'physics_degradation'
-    ]
-    physics_cols = [c for c in physics_cols if c in df.columns]
-    
-    hybrid_features = baseline_features + physics_cols
-    
-    print(f"  Baseline features: {len(baseline_features)}")
-    print(f"  Physics features:  {len(physics_cols)}")
-    print(f"  Hybrid features:   {len(hybrid_features)}")
-    print(f"\n  Physics features: {physics_cols}")
-    
-    # Prepare sequences
-    print_header("PREPARING SEQUENCES")
-    
-    print("\n  [1/2] Baseline sequences:")
-    X_baseline, y_baseline = prepare_sequences(df, baseline_features)
-    
-    print("\n  [2/2] Hybrid sequences:")
-    X_hybrid, y_hybrid = prepare_sequences(df, hybrid_features)
-    
-    # Train Baseline
-    baseline_model, baseline_scaler, baseline_metrics = train_model(
-        X_baseline, y_baseline, baseline_features, 'baseline', MODEL_DIR
-    )
-    
-    # Clear memory
-    del X_baseline, y_baseline
+        print("  ℹ  CPU mode — estimated training time: 30-50 min per model")
+    print(f"  SEQ_LEN={SEQ_LEN}  STRIDE={STRIDE}  SUBSAMPLE=1/{SUBSAMPLE}")
+
+    # ── load ─────────────────────────────────────────────────────────────────
+    df_dev, df_test = load_data()
+
+    # ── feature engineering (on dev only; test uses same scaler) ─────────────
+    print_header("FEATURE ENGINEERING")
+    for label, df in [('dev', df_dev), ('test', df_test)]:
+        df_dev  = add_physics_features(df_dev)  if label == 'dev'  else df_dev
+        df_test = add_physics_features(df_test) if label == 'test' else df_test
+    df_dev  = add_rolling_features(df_dev)
+    df_test = add_rolling_features(df_test)
+    df_dev.fillna(0, inplace=True)
+    df_test.fillna(0, inplace=True)
+
+    # ── feature column lists ──────────────────────────────────────────────────
+    print_header("FEATURE SETS")
+    sensor_cols  = [f's_{i}'   for i in range(1, 15)]          # X_s only (14)
+    op_cols      = ['op_1','op_2','op_3']
+    rolling_cols = [c for c in df_dev.columns if c.endswith(('_ma5','_std5'))]
+    physics_cols = [c for c in ['thermal_ratio','thermal_margin',
+                                'nozzle_thermal_ratio','stress_intensity',
+                                'deformation_index','fatigue_damage']
+                    if c in df_dev.columns]
+
+    baseline_features = [c for c in sensor_cols + op_cols + rolling_cols
+                         if c in df_dev.columns]
+    hybrid_features   = baseline_features + physics_cols
+
+    print(f"  Baseline : {len(baseline_features)} features")
+    print(f"  Physics  : {len(physics_cols)} features  {physics_cols}")
+    print(f"  Hybrid   : {len(hybrid_features)} features")
+
+    # estimated memory for a full array (informational only — we don't build it)
+    n_windows = sum(max(0, len(df_dev[df_dev.unit_nr==e]) - SEQ_LEN + 1)
+                    for e in df_dev.unit_nr.unique())
+    est_gb = n_windows * SEQ_LEN * len(hybrid_features) * 4 / 1024**3
+    print(f"\n  ℹ  Full array would be ~{est_gb:.1f} GB → using generator instead ✓")
+
+    # ── train ─────────────────────────────────────────────────────────────────
+    baseline_model, baseline_scaler, bm = train_model(
+        df_dev, df_test, baseline_features, 'baseline')
+
+    # free model weights from GPU/CPU before training hybrid
     tf.keras.backend.clear_session()
-    
-    # Train Hybrid
-    hybrid_model, hybrid_scaler, hybrid_metrics = train_model(
-        X_hybrid, y_hybrid, hybrid_features, 'hybrid', MODEL_DIR
-    )
-    
-    # Save ANSYS physics
+    gc.collect()
+
+    hybrid_model, hybrid_scaler, hm = train_model(
+        df_dev, df_test, hybrid_features, 'hybrid')
+
+    # save ANSYS constants for backend use
     with open(os.path.join(MODEL_DIR, 'ansys_physics.json'), 'w') as f:
         json.dump(ANSYS_PHYSICS, f, indent=2)
-    
-    # Final comparison
+
+    # ── summary ───────────────────────────────────────────────────────────────
     print_header("FINAL COMPARISON")
-    
-    print(f"\n  {'Model':<15} {'RMSE':<12} {'MAE':<12} {'Time':<12}")
-    print(f"  {'-'*50}")
-    print(f"  {'Baseline':<15} {baseline_metrics['rmse']:<12.2f} {baseline_metrics['mae']:<12.2f} {baseline_metrics['training_time_minutes']:<12.1f} min")
-    print(f"  {'Hybrid':<15} {hybrid_metrics['rmse']:<12.2f} {hybrid_metrics['mae']:<12.2f} {hybrid_metrics['training_time_minutes']:<12.1f} min")
-    
-    improvement = (baseline_metrics['rmse'] - hybrid_metrics['rmse']) / baseline_metrics['rmse'] * 100
-    
-    print(f"\n  " + "="*50)
-    if hybrid_metrics['rmse'] < baseline_metrics['rmse']:
-        print(f"  ✅ HYBRID MODEL WINS!")
-        print(f"     Improvement: {improvement:.1f}% better RMSE")
-        print(f"     Physics integration successful!")
-    else:
-        print(f"  ⚠️ Models have comparable performance")
-        print(f"     Hybrid model still has physics interpretability advantage")
-    print(f"  " + "="*50)
-    
-    total_time = time.time() - total_start
-    
-    print_header("TRAINING COMPLETE")
-    print(f"""
-  Total time: {total_time/60:.1f} minutes
-  
-  Files saved to: {MODEL_DIR}
-  
-  📦 Model Files:
-     • hybrid_model.keras     ← Use this for your app
-     • hybrid_scaler.save
-     • hybrid_features.json
-     • ansys_physics.json
-     • baseline_model.keras   (for comparison)
-     
-  🚀 Next Steps:
-     1. Copy hybrid_model.keras to your project
-     2. Update backend_server.py to use hybrid model
-     3. Run the visualization!
-""")
+    print(f"\n  {'Model':<12} {'RMSE':>8} {'MAE':>8} {'Time':>10}")
+    print(f"  {'-'*42}")
+    print(f"  {'Baseline':<12} {bm['rmse']:>8.2f} {bm['mae']:>8.2f} {bm['time_min']:>8.1f} min")
+    print(f"  {'Hybrid':<12} {hm['rmse']:>8.2f} {hm['mae']:>8.2f} {hm['time_min']:>8.1f} min")
+
+    delta = bm['rmse'] - hm['rmse']
+    pct   = delta / bm['rmse'] * 100
+    print(f"\n  {'✅ Hybrid wins!' if delta > 0 else '⚠ Similar performance'}")
+    if delta > 0:
+        print(f"  RMSE improvement: {delta:.2f} cycles  ({pct:.1f}%)")
+
+    print(f"\n  Total time : {(time.time()-t_total)/60:.1f} min")
+    print(f"  Saved to   : {MODEL_DIR}")
+    print(f"\n  Files:")
+    for f in ['hybrid_model.keras','hybrid_scaler.save','hybrid_features.json',
+              'baseline_model.keras','ansys_physics.json']:
+        print(f"    • {f}")
 
 if __name__ == "__main__":
     main()

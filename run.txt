@@ -1,0 +1,9 @@
+ter 1: & "C:\Program Files\Blender Foundation\Blender 5.0\blender.exe" --background "D:\EL\RUL-prediction-for-aircraft-subsystems\Rocket_DigitalTwin_FINAL.blend" --python "D:\EL\RUL-prediction-for-aircraft-subsystems\blender_server.py"
+
+
+ter 2:cd d:\EL\RUL-prediction-for-aircraft-subsystems\jet-stream-dashboard
+npm run dev
+
+
+ter 3:cd d:\EL\RUL-prediction-for-aircraft-subsystems
+python backend_server.py

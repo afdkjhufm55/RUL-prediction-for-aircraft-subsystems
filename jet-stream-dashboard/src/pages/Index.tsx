@@ -49,10 +49,9 @@ export default function Index() {
   const [animationSpeed, setAnimationSpeed] = useState(1);
   const [autoRotate, setAutoRotate] = useState(false);
 
-  const autoRotateRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const frameUrlRef = useRef<string | null>(null);
 
-// WebSocket
-  // WebSocket
+  const autoRotateRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const { 
     isConnected, 
     isConnecting, 
@@ -95,7 +94,8 @@ export default function Index() {
     },
     // ... keep the rest of your handlers (onFrame, onSimulationComplete, etc.) the same ...
     onFrame: (frameData) => {
-      if (frameUrl) URL.revokeObjectURL(frameUrl);
+      if (frameUrlRef.current) URL.revokeObjectURL(frameUrlRef.current);
+      frameUrlRef.current = frameData;
       setFrameUrl(frameData);
     },
     onSimulationComplete: (data) => {
