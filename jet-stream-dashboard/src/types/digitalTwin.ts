@@ -23,7 +23,7 @@ export interface SensorConfig {
 
 export const SENSOR_CONFIGS: SensorConfig[] = [
   { key: 's_2', label: 'LPC Outlet Temp', unit: '°R', min: 525, max: 655, optimal: 642, description: 'Total Temperature at Low Pressure Compressor outlet' },
-  { key: 's_3', label: 'HPC Outlet Temp', unit: '°R', min: 1200, max: 1650, optimal: 1580, description: 'Total Temperature at High Pressure Compressor outlet' },
+  { key: 's_3', label: 'HPC Outlet Temp', unit: '°R', min: 1200, max: 1650, optimal: 1570, description: 'Total Temperature at High Pressure Compressor outlet' },
   { key: 's_4', label: 'LPT Outlet Temp', unit: '°R', min: 995, max: 1455, optimal: 1400, description: 'Total Temperature at Low Pressure Turbine outlet' },
   { key: 's_7', label: 'HPC Pressure', unit: 'psia', min: 95, max: 600, optimal: 550, description: 'Total Pressure at High Pressure Compressor outlet' },
   { key: 's_11', label: 'Fan Speed', unit: 'rpm', min: 7000, max: 9500, optimal: 8000, description: 'Physical Fan Speed' },
@@ -93,7 +93,7 @@ export interface AnimationMessage extends WebSocketMessage {
 // Optimal sensors for brand new engine
 export const OPTIMAL_SENSORS: SensorData = {
   s_2: 642.0,
-  s_3: 1580.0,
+  s_3: 1570.0,
   s_4: 1400.0,
   s_7: 550.0,
   s_11: 8000.0,

@@ -6,3 +6,4 @@ venv/*
 tf_env/*
 run.txt
 output.txt
+docs/*

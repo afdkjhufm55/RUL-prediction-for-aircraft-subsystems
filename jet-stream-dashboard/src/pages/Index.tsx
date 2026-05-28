@@ -5,6 +5,7 @@ import { StreamViewer } from '@/components/dashboard/StreamViewer';
 import { PredictionPanel } from '@/components/dashboard/PredictionPanel';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { RULGraph } from '@/components/dashboard/RULgraph';
+import { AnalyticsPanel } from '@/components/dashboard/AnalyticsPanel';
 import { useToast } from '@/hooks/use-toast';
 import type { 
   EngineState, 
@@ -36,6 +37,7 @@ export default function Index() {
   const [previousSensors, setPreviousSensors] = useState<SensorData | null>(null);
   const [prediction, setPrediction] = useState<PredictionData | null>(null);
   const [graphData, setGraphData] = useState<{ cycle: number; drul: number }[]>([]);
+  const [rulHistory, setRulHistory] = useState<{ cycle: number; rul: number; status: string }[]>([]);
 
   // View mode
   const [viewMode, setViewMode] = useState<ViewMode>('lifecycle');
@@ -64,6 +66,18 @@ export default function Index() {
     url: WS_URL,
     onPrediction: (data) => {
       setPrediction(data);
+
+      // Populate RUL history for the RUL-over-time graph
+      setRulHistory(prev => {
+        const raw = data as any;
+        let currentCycle = raw.cycle;
+        if (currentCycle === undefined || currentCycle === null) {
+          currentCycle = prev.length > 0 ? prev[prev.length - 1].cycle + 1 : 1;
+        }
+        if (prev.length > 0 && prev[prev.length - 1].cycle === currentCycle) return prev;
+        const next = [...prev, { cycle: currentCycle, rul: data.rul, status: data.status }];
+        return next.length > 200 ? next.slice(next.length - 200) : next;
+      });
 
       setGraphData(prev => {
         const raw = data as any;
@@ -218,6 +232,7 @@ export default function Index() {
     
     // Clear graph history on engine change
     setGraphData([]);
+    setRulHistory([]);
     
     // Request engine info from backend to get random start_cycle
     if (isConnected) {
@@ -262,6 +277,7 @@ export default function Index() {
     setPreviousSensors(null);
     setPrediction(null);
     setGraphData([]);
+    setRulHistory([]);
     setIsSimulating(false);
     setIsAutoPlaying(false);
   }, []);
@@ -405,9 +421,18 @@ export default function Index() {
             />
           </div>
 
-          {/* RUL Graph - Takes available space or fixed height */}
+          {/* RUL Graph - dRUL degradation rate */}
           <div className="flex-shrink-0">
             <RULGraph data={graphData} />
+          </div>
+
+          {/* Analytics Panel - RUL over time + physics + sensor health + fleet */}
+          <div className="flex-shrink-0">
+            <AnalyticsPanel
+              rulHistory={rulHistory}
+              prediction={prediction}
+              sensors={engineState.sensors}
+            />
           </div>
           
         </section>
