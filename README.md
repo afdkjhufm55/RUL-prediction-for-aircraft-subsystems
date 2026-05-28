@@ -59,13 +59,14 @@ pip install -r requirements.txt
 ### 3. Frontend Setup
 Navigate to the frontend directory and install the Node modules.
 ```bash
-cd frontend  # Replace with your actual frontend folder name
+cd jet-stream-dashboard  # Replace with your actual frontend folder name
 npm install
 ```
 
 ##  Running the Digital Twin
 
-To establish the continuous feedback loop, the services must be started simultaneously.
+To establish the continuous feedback loop, the services must be started simultaneously in different terminals.
+Check run.txt for only the commands
 
 **1. Start the Backend Server**
 ```bash
@@ -77,20 +78,26 @@ python backend_server.py
 * Open your 3D engine model (`.blend` file) in Blender.
 * Navigate to the **Scripting** workspace.
 * Open `blender_server.py` and click **Run Script** to start the TCP listener.
+* If it doesnt work use the below command where X.x is the version of the blender and (PROJECT_DIR) is the project's Directory in the system
+```bash
+& "C:\Program Files\Blender Foundation\Blender X.x\blender.exe" --background "(PROJECT_DIR)\Rocket_DigitalTwin_FINAL.blend" --python "(PROJECT_DIR)blender_server.py"
+```
 
 **3. Start the Frontend Dashboard**
 ```bash
-# From the frontend directory
+cd jet-stream-dashboard
 npm start
 ```
 
-Open `http://localhost:3000` in your browser to interact with the Digital Twin.
+Open `http://localhost:5173` in your browser to interact with the Digital Twin.
 
 ##  Model Performance
 
-| Model | RMSE (Cycles) | MAE (Cycles) | Inference Time |
-| :--- | :--- | :--- | :--- |
-| Baseline LSTM | 7.77 | 5.41 | ~18.00 ms |
-| **Physics-Informed Hybrid** | **2.89** | **2.00** | **15.76 ms** |
 
-*The integration of Ansys physics features resulted in a ~63% improvement in overall prediction accuracy while maintaining edge-capable inference speeds.*
+| Model | RMSE (Cycles) | MAE (Cycles) |
+| :--- | :--- | :--- | 
+| Baseline | 7.31 | 6.14   |
+| **Physics-Informed Hybrid** | 6.27 | 5.70   |
+
+  RMSE improvement: 1.04 cycles  (14.2%)
+
