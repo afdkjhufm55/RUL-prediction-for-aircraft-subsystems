@@ -245,17 +245,19 @@ class RealisticEngineSimulator:
             return sensors
 
         # === 1. ACCUMULATED WEAR (only increases over time) ===
-        # Calculate wear increment based on cycles since simulation started
-        max_life = 180
+        # max_life controls how quickly the engine degrades.
+        # Set to 120 so a full lifecycle (RUL 125→0) plays out within
+        # the default 200-cycle simulation window.
+        max_life = 120
         life_fraction = min(1.0, cycle / max_life)
 
         # Bathtub curve: slow early, steady middle, accelerating late
         if life_fraction < 0.25:
-            wear_increment = 0.002 + life_fraction * 0.003
+            wear_increment = 0.003 + life_fraction * 0.005
         elif life_fraction < 0.65:
-            wear_increment = 0.004 + (life_fraction - 0.25) * 0.005
+            wear_increment = 0.006 + (life_fraction - 0.25) * 0.008
         else:
-            wear_increment = 0.006 + (life_fraction - 0.65) * 0.015
+            wear_increment = 0.010 + (life_fraction - 0.65) * 0.025
 
         # Add small random variation to wear increment
         wear_increment *= random.uniform(0.7, 1.3)
@@ -396,6 +398,10 @@ class HybridMLPredictor:
         self.model_loaded = False
         self._rul_cache = {}
         self._last_rul = {}
+        # Tracks (last_cycle, last_rul) per engine_id so drul reflects the
+        # actual observed change in rul for THAT engine, instead of a
+        # disconnected formula that didn't match what rul was doing.
+        self._prev_rul_state: Dict[int, tuple] = {}
         
         # Realistic simulator for custom engine
         self._engine_simulator = RealisticEngineSimulator()
@@ -467,6 +473,7 @@ class HybridMLPredictor:
     def reset_custom_engine(self, initial_sensors: Dict = None):
         """Reset the custom engine simulator, optionally starting from given sensor values."""
         self._engine_simulator.reset(initial_sensors)
+        self._prev_rul_state.pop(0, None)
         
     def update_custom_engine(self, sensors: Dict):
         """Update the running state of the custom engine without resetting."""
@@ -517,6 +524,7 @@ class HybridMLPredictor:
         if engine_id == 0:
             # Reset simulator for new custom engine
             self._engine_simulator.reset()
+            self._prev_rul_state.pop(0, None)
             return {
                 'total_cycles': 300, 
                 'max_cycle': 300, 
@@ -544,6 +552,8 @@ class HybridMLPredictor:
             del self._rul_cache[engine_id]
         if engine_id in self._last_rul:
             del self._last_rul[engine_id]
+        if engine_id in self._prev_rul_state:
+            del self._prev_rul_state[engine_id]
         
         result = {
             'total_cycles': len(engine_data),
@@ -806,37 +816,34 @@ class HybridMLPredictor:
                 sensors = self._engine_simulator.apply_wear_to_inputs(sensors)
             
             physics = self._calculate_physics_features(sensors)
-            
-            thermal = physics.get('thermal_ratio', 0.99)
-            stress = physics.get('stress_intensity', 0.9)
-            vibration = physics.get('vibration_index', 0.1)
-            
-            # Tuned health scores: Relaxed baselines to ensure initial state is ~1.0 (RUL 125)
-            # Even if input sensors are slightly above optimal (noise/slider defaults), 
-            # we want the starting condition to register as Healthy.
-            
-            # Thermal: Optimal ~0.96. Relaxed baseline to 1.00. 
-            # Anything below 1.00 ratio counts as perfect health.
-            thermal_health = max(0, min(1, (1.15 - thermal) / (1.15 - 1.00)))
-            
-            # Stress: Optimal ~0.83. Relaxed baseline to 0.90.
-            # Anything below 0.90 stress counts as perfect health.
-            stress_health = max(0, min(1, (1.10 - stress) / (1.10 - 0.90)))
-            
-            # Vibration: Optimal ~0.01. Relaxed baseline to 0.10.
-            vibration_health = max(0, min(1, (1.0 - vibration) / (1.0 - 0.10)))
-            
-            overall_health = (
-                thermal_health * 0.40 +
-                stress_health * 0.40 +
-                vibration_health * 0.20
-            )
-            
-            rul = overall_health * RUL_CLIP
-            rul = max(0, min(RUL_CLIP, rul))
-            
-            print(f"    [Custom] Cycle {cycle}: s3={sensors.get('s_3', 0):.1f}, s7={sensors.get('s_7', 0):.1f}, s11={sensors.get('s_11', 0):.0f}, s15={sensors.get('s_15', 0):.2f}")
-            print(f"            T={thermal:.3f}({thermal_health:.2f}) S={stress:.3f}({stress_health:.2f}) V={vibration:.3f}({vibration_health:.2f}) -> RUL={rul:.1f}")
+
+            # ── RUL from accumulated wear ────────────────────────────────────
+            # Use the simulator's wear directly (0 = new, 1 = end of life).
+            # This guarantees RUL actually decreases as cycles accumulate,
+            # regardless of how small the per-cycle sensor shifts are.
+            # For manual (paused) mode we fall back to the physics heuristic
+            # since no wear accumulation has happened.
+            if is_simulation:
+                wear = self._engine_simulator._accumulated_wear  # 0.0 → 1.0
+                rul = max(0.0, min(RUL_CLIP, (1.0 - wear) * RUL_CLIP))
+            else:
+                # Manual mode: derive health from current sensor snapshot
+                thermal = physics.get('thermal_ratio', 0.99)
+                stress  = physics.get('stress_intensity', 0.9)
+                vibration = physics.get('vibration_index', 0.1)
+
+                thermal_health   = max(0, min(1, (1.15 - thermal)   / (1.15 - 1.00)))
+                stress_health    = max(0, min(1, (1.10 - stress)     / (1.10 - 0.90)))
+                vibration_health = max(0, min(1, (1.0  - vibration)  / (1.0  - 0.10)))
+
+                overall_health = (
+                    thermal_health * 0.40 +
+                    stress_health  * 0.40 +
+                    vibration_health * 0.20
+                )
+                rul = max(0, min(RUL_CLIP, overall_health * RUL_CLIP))
+
+            print(f"    [Custom] Cycle {cycle}: wear={self._engine_simulator._accumulated_wear:.3f} -> RUL={rul:.1f} | s3={sensors.get('s_3', 0):.1f} s7={sensors.get('s_7', 0):.1f}")
         
         # REAL ENGINES (1-248)
         else:
@@ -897,7 +904,27 @@ class HybridMLPredictor:
                     rul = max(0, final_rul - extra_cycles)
                     print(f"    [Fallback] Engine {engine_id}, Cycle {cycle}: RUL={rul:.1f}")
         
-        drul = -0.4 - physics['stress_intensity'] * 0.3 - physics['vibration_index'] * 0.2
+        # drul = actual observed rate of change of THIS engine's rul between
+        # consecutive calls, so it always matches what rul is really doing
+        # (previously this was a static physics formula that ignored engine_id
+        # and the prior rul entirely, so it could disagree with rul - e.g.
+        # showing "degrading" drul while rul was flat or improving, or vice
+        # versa, especially right after switching the selected engine).
+        prev_state = self._prev_rul_state.get(engine_id)
+        if prev_state is not None:
+            prev_cycle, prev_rul = prev_state
+            cycle_delta = cycle - prev_cycle
+            if cycle_delta != 0:
+                drul = (rul - prev_rul) / cycle_delta
+            else:
+                drul = 0.0
+        else:
+            # No prior reading yet for this engine - fall back to a
+            # physics-based estimate just for this first call.
+            drul = -0.4 - physics['stress_intensity'] * 0.3 - physics['vibration_index'] * 0.2
+
+        self._prev_rul_state[engine_id] = (cycle, rul)
+
         status = determine_status(rul)
         
         return {

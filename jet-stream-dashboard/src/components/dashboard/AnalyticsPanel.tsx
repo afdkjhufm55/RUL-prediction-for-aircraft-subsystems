@@ -1,8 +1,7 @@
 import { BarChart2 } from 'lucide-react';
 import { RULTimeGraph } from './RULTimeGraph';
 import { PhysicsRadar } from './PhysicsRadar';
-import { SensorHealthChart } from './SensorHealthChart';
-import { FleetStatusChart } from './FleetStatusChart';
+import { ModelComparisonChart } from './ModelComparisonChart';
 import type { PredictionData, SensorData } from '@/types/digitalTwin';
 
 interface RULPoint {
@@ -17,7 +16,7 @@ interface AnalyticsPanelProps {
   sensors: SensorData;
 }
 
-export function AnalyticsPanel({ rulHistory, prediction, sensors }: AnalyticsPanelProps) {
+export function AnalyticsPanel({ rulHistory, prediction }: AnalyticsPanelProps) {
   return (
     <div className="space-y-4">
       {/* Section header */}
@@ -30,11 +29,10 @@ export function AnalyticsPanel({ rulHistory, prediction, sensors }: AnalyticsPan
       {/* Row 1: RUL over time — full width */}
       <RULTimeGraph data={rulHistory} />
 
-      {/* Row 2: three charts side by side */}
-      <div className="grid grid-cols-3 gap-4">
+      {/* Row 2: Physics radar + Model comparison */}
+      <div className="grid grid-cols-2 gap-4">
         <PhysicsRadar prediction={prediction} />
-        <SensorHealthChart sensors={sensors} />
-        <FleetStatusChart />
+        <ModelComparisonChart />
       </div>
     </div>
   );
