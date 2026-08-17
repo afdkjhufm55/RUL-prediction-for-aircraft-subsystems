@@ -6,4 +6,4 @@ venv/*
 tf_env/*
 run2.txt
 output.txt
-docs/*
+# docs/ is tracked (architecture diagrams, demo GIF placeholder)

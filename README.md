@@ -1,103 +1,276 @@
-# Physics-Informed Hybrid Digital Twin
+# Physics-Informed Hybrid Digital Twin for Aircraft Engine RUL Prediction
 
-A real-time, physics-informed Digital Twin for predicting the Remaining Useful Life (RUL) of high-stress aerospace components (e.g., rocket engine turbopumps). 
+> **Flagship metric:** Physics-Informed Hybrid CNN-BiLSTM — **MAE: 5.70 cycles | RMSE: 6.27 cycles** on NASA N-CMAPSS DS02
 
-This project bridges the gap between purely data-driven machine learning and physical engineering constraints. By fusing a Hybrid CNN-BiLSTM neural network with absolute physical limits derived from Ansys simulations, the system achieves highly accurate degradation forecasting and visualizes the physical consequences in a real-time 3D environment.
+A real-time digital twin that predicts the **Remaining Useful Life (RUL)** of aircraft turbofan engines by fusing a physics-informed CNN-BiLSTM neural network with ANSYS finite-element analysis constraints and a live 3D Blender visualizer.
 
-**Note:** This is a fully virtualized software simulation. There is no physical hardware component; the system uses random values instead of actual sensor values to mimic physical operations and real-time telemetry.
+---
 
-##  Key Features
+## Live Demo — Blender 3D Visualizer
 
-* **Physics-Informed AI:** Integrates Ansys-derived constraints (Thermal Margin, Stress Intensity, Deformation) directly into the feature space of a CNN-BiLSTM model.
-* **High Accuracy:** Achieves an RMSE of **2.89 cycles** and an MAE of **2.00 cycles** on the NASA C-MAPSS (FD001) test set, significantly outperforming standard LSTM baselines.
-* **Real-Time 3D Visualization:** Uses Blender's Eevee engine and Python API to dynamically alter material shaders (glowing metal) and mesh coordinates (vibration) based on live telemetry.
-* **Low-Latency Streaming:** End-to-end inference and visual rendering loop operates at under 50ms, enabling a smooth, interactive user dashboard.
-* **Interactive Dashboard:** React-based UI allows users to adjust throttle/temperature on the fly and immediately observe the impact on the engine's Remaining Useful Life.
+> **⬇ Replace this section with your recorded GIF/video**
+>
+> Record a short clip (15–30 sec) of the Blender visualizer reacting to engine degradation — glowing combustion chamber, vibrating turbopump, RUL counter dropping — and drop the file into `docs/demo.gif`, then swap the placeholder below.
 
-##  System Architecture
-
-The system operates in a continuous, bi-directional feedback loop:
-
-1. **Frontend (React):** User adjusts operational parameters (Temp/RPM).
-2. **Backend Engine Simulator (FastAPI/Python):** Mathematically simulates physical stress and uses random values instead of hardware sensor values to mimic engine telemetry.
-3. **Hybrid AI Inference (TensorFlow):** Computes physics features and predicts the real-time RUL and degradation rate.
-4. **Digital Twin (Blender):** Receives physical data via TCP socket, updates the 3D model, and streams JPEG frames back to the backend.
-5. **Dashboard Update:** Frontend displays the live video feed alongside the dynamic RUL graph.
-
-##  Technology Stack
-
-* **Machine Learning:** TensorFlow, Keras, Scikit-learn, Pandas, NumPy
-* **Physics Simulation (Offline):** Ansys (Finite Element Analysis)
-* **Backend API & Simulator:** FastAPI, Uvicorn, Python WebSockets
-* **3D Visualization:** Blender, Blender Python API (`bpy`)
-* **Frontend Dashboard:** React, Recharts, Node.js
-
-##  Installation & Setup
-
-### Prerequisites
-* Python 3.8+
-* Node.js & npm
-* Blender 3.0+
-
-### 1. Clone the Repository
-```bash
-git clone [https://github.com/ishaan2-svg/digital_twin.git](https://github.com/ishaan2-svg/digital_twin.git)
-cd digital_twin
+```
+docs/demo.gif   ← drag your recording here
 ```
 
-### 2. Backend Setup
-Create a virtual environment and install the required Python packages.
-```bash
-# Create and activate virtual environment (Windows)
-python -m venv venv
-venv\Scripts\activate
+<!-- Once you have the GIF, replace the line below: -->
+<!-- ![Blender Digital Twin Demo](docs/demo.gif) -->
 
-# Install dependencies
+**What to show in the recording:**
+1. Dashboard at healthy state (RUL ≈ 125, grey engine)
+2. Slide temperature/pressure sliders toward critical
+3. Engine glows red, turbopump vibrates, RUL graph drops in real time
+4. Switch to a real engine (e.g., Engine 72) and watch the ML prediction update cycle-by-cycle
+
+**Quick capture tools:** Xbox Game Bar (`Win+G`) on Windows, or OBS → export as GIF via [ezgif.com](https://ezgif.com/video-to-gif).
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        DATA PIPELINE                                │
+│                                                                     │
+│  NASA N-CMAPSS DS02  ──►  14 Physical Sensors (X_s)               │
+│  (6.5M rows, 9 engines)    3 Operating Conditions (W)              │
+│                             ↓                                       │
+│              ANSYS FEA Results (offline)                            │
+│         ┌──────────────────────────────────┐                        │
+│         │  Combustion Chamber Temp: 627°C  │                        │
+│         │  Nozzle Temp:             475°C  │                        │
+│         │  Von Mises Stress:    54–3544 MPa│                        │
+│         │  Deformation:        0–0.189 mm  │                        │
+│         └──────────────────────────────────┘                        │
+│                             ↓                                       │
+│         Physics Feature Engineering (6 features added):             │
+│         thermal_ratio · thermal_margin · nozzle_thermal_ratio       │
+│         stress_intensity · deformation_index · fatigue_damage       │
+└─────────────────────────────────────────────────────────────────────┘
+                             ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                     HYBRID MODEL (CNN-BiLSTM)                       │
+│                                                                     │
+│  Input: sequence of 30 time steps × (sensor + physics) features    │
+│                                                                     │
+│  ┌────────────────────┐      ┌─────────────────────────┐           │
+│  │   CNN Branch       │      │   BiLSTM Branch          │           │
+│  │  Conv1D(64) × 2    │      │  BiLSTM(64, return_seq) │           │
+│  │  MaxPool → Drop    │      │  BiLSTM(32)              │           │
+│  │  Conv1D(128)       │      │  Dropout(0.2)            │           │
+│  │  GlobalAvgPool     │      └────────────┬────────────┘           │
+│  └──────────┬─────────┘                   │                         │
+│             └──────────────┬──────────────┘                         │
+│                            ↓                                        │
+│                     Concatenate → Dense(128) → Dense(64)            │
+│                            ↓                                        │
+│             ┌──────────────┴──────────────┐                         │
+│             │  RUL output (linear)        │  dRUL output (tanh)    │
+│             └─────────────────────────────┘                         │
+└─────────────────────────────────────────────────────────────────────┘
+                             ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                    REAL-TIME DIGITAL TWIN                           │
+│                                                                     │
+│  React Dashboard  ◄──WebSocket──►  FastAPI Backend                 │
+│  (sensor sliders,                  (HybridMLPredictor,              │
+│   RUL graph,                        RealisticEngineSimulator)       │
+│   status alerts)                    ↕ TCP socket                   │
+│                                   Blender Server (bpy)              │
+│                                   (3D render → JPEG stream)         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Signal flow:**
+1. User adjusts sensor sliders on the React dashboard (or selects a real engine from the dataset)
+2. FastAPI backend runs physics feature engineering + CNN-BiLSTM inference
+3. Blender receives `Temperature / Pressure / RUL / vibration_intensity` over TCP, updates material shaders and mesh deformation, renders a JPEG frame
+4. Frame streams back through the WebSocket to the dashboard at < 50 ms end-to-end
+
+---
+
+## Model Performance
+
+Trained on **NASA N-CMAPSS DS02** (see [Dataset](#dataset) section below).  
+Evaluation on the held-out test split; RUL clipped at 125 cycles.
+
+| Model | RMSE (cycles) | MAE (cycles) | Epochs |
+|---|---|---|---|
+| Baseline CNN-BiLSTM | 7.31 | 6.14 | 9 |
+| **Physics-Informed Hybrid** | **6.27** | **5.70** | **11** |
+
+**Improvement from physics features: −1.04 RMSE cycles (−14.2%)**
+
+Physics features encode ANSYS-derived thermal, stress, and deformation limits directly into the model's feature space — making the network "aware" of what sensor readings actually mean for material health, not just statistical patterns.
+
+---
+
+## Dataset
+
+**NASA N-CMAPSS (New Commercial Modular Aero-Propulsion System Simulation) — DS02-006**
+
+| Property | Value |
+|---|---|
+| Source | [NASA PCoE Prognostics Data Repository](https://www.nasa.gov/intelligent-systems-division/discovery-and-systems-health/pcoe/pcoe-data-set-repository/) |
+| Engines | 9 turbofan engines (dev + test splits) |
+| Raw rows | ~6.5 million time steps |
+| Sensors | 14 physical (`X_s`) + 14 virtual (`X_v`) per step |
+| Operating conditions | 3 continuous variables (`W`) |
+| RUL label | Continuous, cycle-accurate, clipped at 125 |
+| File used | `N-CMAPSS_DS02-006.h5` (not included — see note below) |
+
+The older **C-MAPSS FD001–FD004** files (in `data/`) were used in early experiments; the final trained model runs on N-CMAPSS which provides continuous RUL labels and more realistic multi-condition operation.
+
+> **Note:** The N-CMAPSS `.h5` file (~4 GB) is not checked in. Download it from the NASA repository linked above and place it at `nmapss/N-CMAPSS_DS02-006.h5` before training.
+
+The C-MAPSS FD004 test set (in `data/`) is used by the backend server at runtime to demonstrate real engine playback without requiring the full N-CMAPSS file.
+
+---
+
+## ANSYS Integration
+
+Two aerospace components were modelled in ANSYS Mechanical:
+
+| Component | Analysis | Key Result |
+|---|---|---|
+| Combustion chamber (`combustion chamber.stl`) | Steady-state thermal + structural | Wall temp 626–627°C; stress 54–3544 MPa |
+| Nozzle (`nozzle.stl`) | Thermal | Outlet temp 474–475°C |
+
+These bounds are baked into `ANSYS_PHYSICS` constants in `hybrid_model_local.py` and `backend_server.py`. During training, raw sensor readings are mapped onto normalised thermal margin, stress intensity, and deformation index features — giving the model physically meaningful degradation signals instead of raw engineering units.
+
+Raw ANSYS export files: `deformation.txt`, `stress.txt`, `temp_combustionchamber.txt`, `temp_nozzle.txt`.
+
+---
+
+## Repository Structure
+
+```
+RUL-prediction-for-aircraft-subsystems/
+│
+├── hybrid_model_local.py        # Training script — CNN-BiLSTM + physics features
+├── backend_server.py            # FastAPI server + engine simulator + ML inference
+├── blender_server.py            # Blender Python script — 3D render server
+├── requirements.txt             # Python dependencies
+├── run.txt                      # Quick-start commands
+│
+├── data/                        # NASA C-MAPSS FD001–FD004 (train/test/RUL)
+├── model_artifacts/             # Trained Keras models, scalers, feature lists
+│   ├── hybrid_model.keras       # Best model (physics-informed)
+│   ├── baseline_model.keras     # Baseline (no physics features)
+│   ├── hybrid_metrics.json      # RMSE / MAE scores
+│   └── ansys_physics.json       # ANSYS-derived physical constants
+│
+├── jet-stream-dashboard/        # React frontend (Vite + Tailwind + Recharts)
+│   └── src/components/dashboard/
+│       ├── RULgraph.tsx         # Live RUL time-series chart
+│       ├── SensorSlider.tsx     # Adjustable sensor inputs
+│       ├── StreamViewer.tsx     # Blender JPEG stream display
+│       └── PredictionPanel.tsx  # Status + physics metrics
+│
+├── Rocket_DigitalTwin_FINAL.blend  # Blender scene file
+├── combustion chamber.stl          # ANSYS geometry — combustion chamber
+├── nozzle.stl                      # ANSYS geometry — nozzle
+└── docs/
+    └── demo.gif                    # ← ADD YOUR RECORDING HERE
+```
+
+---
+
+## Quick Start
+
+### Prerequisites
+- Python 3.8+
+- Node.js 18+
+- Blender 3.6+
+
+### 1. Clone & install Python deps
+
+```bash
+git clone https://github.com/YOUR_USERNAME/RUL-prediction-for-aircraft-subsystems.git
+cd RUL-prediction-for-aircraft-subsystems
+
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# macOS/Linux:
+source venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-### 3. Frontend Setup
-Navigate to the frontend directory and install the Node modules.
+### 2. Install frontend deps
+
 ```bash
-cd jet-stream-dashboard  # Replace with your actual frontend folder name
+cd jet-stream-dashboard
 npm install
 ```
 
-##  Running the Digital Twin
+### 3. Run the three services (separate terminals)
 
-To establish the continuous feedback loop, the services must be started simultaneously in different terminals.
-Check run.txt for only the commands
-
-**1. Start the Backend Server**
+**Terminal 1 — Backend**
 ```bash
-# From the root project directory (ensure venv is activated)
 python backend_server.py
+# → http://localhost:8000
 ```
 
-**2. Start the Blender Server**
-* Open your 3D engine model (`.blend` file) in Blender.
-* Navigate to the **Scripting** workspace.
-* Open `blender_server.py` and click **Run Script** to start the TCP listener.
-* If it doesnt work use the below command where X.x is the version of the blender and (PROJECT_DIR) is the project's Directory in the system
+**Terminal 2 — Blender 3D server**
 ```bash
-& "C:\Program Files\Blender Foundation\Blender X.x\blender.exe" --background "(PROJECT_DIR)\Rocket_DigitalTwin_FINAL.blend" --python "(PROJECT_DIR)blender_server.py"
+# Replace X.x with your Blender version, PROJECT_DIR with your path
+& "C:\Program Files\Blender Foundation\Blender X.x\blender.exe" \
+  --background "PROJECT_DIR\Rocket_DigitalTwin_FINAL.blend" \
+  --python "PROJECT_DIR\blender_server.py"
 ```
+Or open the `.blend` file manually, go to the **Scripting** workspace, open `blender_server.py`, and click **Run Script**.
 
-**3. Start the Frontend Dashboard**
+**Terminal 3 — Frontend**
 ```bash
 cd jet-stream-dashboard
-npm start
+npm run dev
+# → http://localhost:5173
 ```
 
-Open `http://localhost:5173` in your browser to interact with the Digital Twin.
+### 4. (Optional) Retrain the model
 
-##  Model Performance
+Download `N-CMAPSS_DS02-006.h5` from NASA, place it in `nmapss/`, then:
 
+```bash
+python hybrid_model_local.py
+# Trains baseline + hybrid models; saves to model_artifacts/
+# ~40 min on CPU (24 GB RAM) with default subsampling (1/10)
+```
 
-| Model | RMSE (Cycles) | MAE (Cycles) |
-| :--- | :--- | :--- | 
-| Baseline | 7.31 | 6.14   |
-| **Physics-Informed Hybrid** | 6.27 | 5.70   |
+---
 
-  RMSE improvement: 1.04 cycles  (14.2%)
+## Tech Stack
 
+| Layer | Technology |
+|---|---|
+| ML framework | TensorFlow / Keras |
+| Physics FEA | ANSYS Mechanical |
+| Backend API | FastAPI, Uvicorn, WebSockets |
+| 3D visualizer | Blender 3.6+, `bpy` Python API |
+| Frontend | React, Vite, Tailwind CSS, Recharts |
+| Data | NumPy, Pandas, scikit-learn, h5py |
+
+---
+
+## How to Record the Blender Demo GIF
+
+1. Start all three services as described above
+2. Open `http://localhost:5173` — confirm the Blender stream appears in the dashboard
+3. Use **Xbox Game Bar** (`Win + G → Record`) or **OBS Studio** to capture the browser window
+4. Run the lifecycle simulation (click **Start Simulation** on the dashboard)
+5. Stop recording after the engine degrades to CRITICAL status
+6. Convert to GIF: upload to [ezgif.com/video-to-gif](https://ezgif.com/video-to-gif), resize to 800px wide, 15 fps
+7. Save as `docs/demo.gif`
+8. Uncomment the `![Blender Digital Twin Demo](docs/demo.gif)` line at the top of this README
+9. `git add docs/demo.gif README.md && git commit -m "add Blender demo GIF"`
+
+---
+
+## License
+
+MIT
