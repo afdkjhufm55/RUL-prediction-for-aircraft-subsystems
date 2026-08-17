@@ -1,6 +1,6 @@
 # Physics-Informed Hybrid Digital Twin for Aircraft Engine RUL Prediction
 
-> **Flagship metric:** Physics-Informed Hybrid CNN-BiLSTM — **MAE: 5.70 cycles | RMSE: 6.27 cycles** on NASA N-CMAPSS DS02
+>Physics-Informed Hybrid CNN-BiLSTM — **MAE: 5.70 cycles | RMSE: 6.27 cycles** on NASA N-CMAPSS DS02
 
 A real-time digital twin that predicts the **Remaining Useful Life (RUL)** of aircraft turbofan engines by fusing a physics-informed CNN-BiLSTM neural network with ANSYS finite-element analysis constraints and a live 3D Blender visualizer.
 
@@ -8,24 +8,7 @@ A real-time digital twin that predicts the **Remaining Useful Life (RUL)** of ai
 
 ## Live Demo — Blender 3D Visualizer
 
-> **⬇ Replace this section with your recorded GIF/video**
->
-> Record a short clip (15–30 sec) of the Blender visualizer reacting to engine degradation — glowing combustion chamber, vibrating turbopump, RUL counter dropping — and drop the file into `docs/demo.gif`, then swap the placeholder below.
-
-```
-docs/demo.gif   ← drag your recording here
-```
-
-<!-- Once you have the GIF, replace the line below: -->
-<!-- ![Blender Digital Twin Demo](docs/demo.gif) -->
-
-**What to show in the recording:**
-1. Dashboard at healthy state (RUL ≈ 125, grey engine)
-2. Slide temperature/pressure sliders toward critical
-3. Engine glows red, turbopump vibrates, RUL graph drops in real time
-4. Switch to a real engine (e.g., Engine 72) and watch the ML prediction update cycle-by-cycle
-
-**Quick capture tools:** Xbox Game Bar (`Win+G`) on Windows, or OBS → export as GIF via [ezgif.com](https://ezgif.com/video-to-gif).
+![Blender Digital Twin Demo](docs/demo.gif)
 
 ---
 
@@ -257,20 +240,6 @@ python hybrid_model_local.py
 
 ---
 
-## How to Record the Blender Demo GIF
-
-1. Start all three services as described above
-2. Open `http://localhost:5173` — confirm the Blender stream appears in the dashboard
-3. Use **Xbox Game Bar** (`Win + G → Record`) or **OBS Studio** to capture the browser window
-4. Run the lifecycle simulation (click **Start Simulation** on the dashboard)
-5. Stop recording after the engine degrades to CRITICAL status
-6. Convert to GIF: upload to [ezgif.com/video-to-gif](https://ezgif.com/video-to-gif), resize to 800px wide, 15 fps
-7. Save as `docs/demo.gif`
-8. Uncomment the `![Blender Digital Twin Demo](docs/demo.gif)` line at the top of this README
-9. `git add docs/demo.gif README.md && git commit -m "add Blender demo GIF"`
-
----
-
 ## License
 
-MIT
+GPL
